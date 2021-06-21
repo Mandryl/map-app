@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Evacuation Map</title>
+  <style>
+    body {
+      margin: 0;
+    }
+
+    #map {
+      height: 100vh;
+      /* 100% of viewport height */
+    }
+  </style>
+</head>
+
+<body>
+  <!-- map container -->
+  <div id="map" />
+
+  <!-- CSS dependencies -->
+  <link href="https://unpkg.com/maplibre-gl@1.14.0/dist/maplibre-gl.css" rel="stylesheet" />
+  <!-- JavaScript dependencies -->
+  <script src="https://unpkg.com/maplibre-gl@1.14.0/dist/maplibre-gl.js"></script>
+  <script src="./aws-sdk-2.926.0.min.js"></script>
+  <script src="https://unpkg.com/@aws-amplify/core@3.7.0/dist/aws-amplify-core.min.js"></script>
+
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/toastr.js/latest/toastr.min.css" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/toastr.js/latest/toastr.min.js" type="text/javascript"></script>
+
+  <script src="https://cdn.jsdelivr.net/npm/geolib@3.3.1/lib/index.min.js" type="text/javascript"></script>
+
+  <script>
+    var map = null;
+    var devicePosition = null;
+    var shelters = null;
+    var shelterPopups = [];
+    var shelterMarker = [];
+    var routePopup = null;
+    var dangerZone = null;
+    var located = false;
+
+    const DANGER_RADIUS = 50;
+
+    // application-specific code
+    // Cognito Identity Pool ID
+    const identityPoolId =
+      "ap-northeast-1:d316913c-14cc-498a-bd1b-d715ec2c4a05";
+
+    // extract the Region from the Identity Pool ID; this will be used for both Amazon Cognito and Amazon Location
+    AWS.config.region = "ap-northeast-1";
+
+    // instantiate an Amazon Cognito-backed credential provider
+    const credentials = new AWS.CognitoIdentityCredentials({
+      IdentityPoolId: identityPoolId,
+    });
+
+    const locationService = new AWS.Location({
+      credentials: credentials,
+      region: AWS.config.region,
+    });
+
+    // use Signer from @aws-amplify/core
+    const { Signer } = window.aws_amplify_core;
+
+    /**
+     * Sign requests made by MapLibre GL JS using AWS SigV4.
+     */
+    function transformRequest(url, resourceType) {
+      if (resourceType === "Style" && !url.includes("://")) {
+        // resolve to an AWS URL
+        url = `https://maps.geo.${AWS.config.region}.amazonaws.com/maps/v0/maps/${url}/style-descriptor`;
+      }
+
+      if (url.includes("amazonaws.com")) {
+        // only sign AWS requests (with the signature as part of the query string)
+        return {
+          url: Signer.signUrl(url, {
+            access_key: credentials.accessKeyId,
+            secret_key: credentials.secretAccessKey,
+            session_token: credentials.sessionToken,
+          }),
+        };
+      }
+
+      // don't sign
+      return { url };
+    }
+
+    async function initialPosition(code) {
+      if (code) {
+        const countryCode = code.split("-")[0];
+        const regionName = new Intl.DisplayNames(["en"], { type: "region" });
+        const countryName = regionName.of(countryCode);
+        const countryGeo = await locationService
+          .searchPlaceIndexForText({
+            IndexName: "TokyoIndex",
+            MaxResults: 1,
+            Text: countryName,
+          })
+          .promise();
+        devicePosition = countryGeo.Results[0].Place.Geometry.Point;
+      } else {
+        devicePosition = [139.6924324320139, 35.68976695752075];
+      }
+      return devicePosition;
+    }
+
+    async function initializeMap(code) {
+      // load credentials and set them up to refresh
+      await credentials.getPromise();
+      await initialPosition(code);
+
+      // Initialize the map
+      map = new maplibregl.Map({
+        container: "map",
+        center: devicePosition, // initial map centerpoint
+        zoom: 13, // initial map zoom
+        style: "Tokyo",
+        transformRequest,
+      });
+
+      map.addControl(new maplibregl.NavigationControl(), "top-left");
+      const geolocateCtrl = geolocate();
+      map.addControl(geolocateCtrl, "top-left");
+      map.on("load", () => {
+        geolocateCtrl.trigger();
+      });
+
+      map.on("click", "route", () => {
+        if (routePopup && !routePopup.isOpen()) {
+          routePopup.remove();
+          routePopup.addTo(map);
+        }
+      });
+    }
+
+    function geolocate() {
+      const geolocate = new maplibregl.GeolocateControl({
+        trackUserLocation: true,
+        fitBoundsOptions: {
+          maxZoom: 13,
+          linear: true,
+        },
+      });
+
+      geolocate.on("geolocate", (position) => {
+        devicePosition = [
+          position.coords.longitude,
+          position.coords.latitude,
+        ];
+        if (!located) {
+          located = true;
+
+          const query = window.location.search;
+          const params = new URLSearchParams(query.substring(1));
+          const random = params.get("random");
+          const code = params.get("code");
+          initializeShelterLocation(code, random);
+          initializeDangerZone(code, random);
+        }
+      });
+
+      return geolocate;
+    }
+
+    async function addMarker(position, html) {
+      const popup = new maplibregl.Popup({ offset: 25 }).setHTML(html);
+
+      shelterPopups.push(popup);
+
+      const marker = new maplibregl.Marker();
+      shelterMarker.push(marker);
+
+      marker.setLngLat(position).setPopup(popup).addTo(map);
+    }
+
+    async function route(start, goal) {
+      if (shelterPopups.length) {
+        shelterPopups.forEach((elem) => {
+          elem.remove();
+        });
+      }
+      const route = await calculateRoute(start, goal);
+      drawRoute(route);
+
+      const bounds = geolib.getBounds([start, goal]);
+
+      map.fitBounds(
+        [
+          [bounds.minLng, bounds.minLat],
+          [bounds.maxLng, bounds.maxLat],
+        ],
+        {
+          padding: 15,
+          maxZoom: 15,
+        }
+      );
+
+      toastr.options.closeButton = true;
+      toastr.options.closeDuration = 500;
+      toastr.info(`During the evacuation, 
+                        be careful to avoid the areas marked in red.`);
+    }
+
+    async function calculateRoute(start, goal) {
+      const route = await locationService
+        .calculateRoute({
+          CalculatorName: "TokyoRoute",
+          DeparturePosition: start,
+          DestinationPosition: goal,
+          DepartNow: true,
+          IncludeLegGeometry: true,
+          TravelMode: "Walking",
+        })
+        .promise();
+
+      return route;
+    }
+
+    async function drawRoute(route) {
+      if (map.getLayer("route")) {
+        map.removeLayer("route");
+      }
+      if (map.getSource("route")) {
+        map.removeSource("route");
+      }
+      if (routePopup) {
+        routePopup.remove();
+      }
+
+      // const verified = await verifySafeLines(route);
+
+      const geometryLine = route.Legs[0].Geometry.LineString;
+      console.log(geometryLine);
+
+      map.addSource("route", {
+        type: "geojson",
+        data: {
+          type: "Feature",
+          properties: {},
+          geometry: {
+            type: "LineString",
+            // coordinates: verified.line,
+            coordinates: geometryLine,
+          },
+        },
+      });
+
+      map.addLayer({
+        id: "route",
+        type: "line",
+        source: "route",
+        layout: {
+          "line-join": "round",
+          "line-cap": "round",
+        },
+        paint: {
+          "line-color": "#888",
+          "line-width": 5,
+        },
+      });
+
+      const distance = route.Summary.Distance.toFixed(1);
+      const duration = (route.Summary.DurationSeconds / 60).toFixed(1);
+      const midPoint = geometryLine[Math.round(geometryLine.length / 2)];
+
+      // const distance = verified.distance.toFixed(1);
+      // const duration = (verified.sec / 60).toFixed(1);
+      // const midPoint = verified.line[Math.round(verified.line.length / 2)];
+
+      const popup = new maplibregl.Popup({
+        closeOnClick: false,
+      })
+        .setLngLat(midPoint)
+        .setHTML(
+          `Time: ${duration} [min]<br>
+          Distance: ${distance} [km]`
+        )
+        .addTo(map);
+
+      routePopup = popup;
+    }
+
+    async function initializeFunctionAll() {
+      const query = window.location.search;
+      const params = new URLSearchParams(query.substring(1));
+      const code = params.get("code");
+      const random = params.get("random");
+
+      await initializeMap(code);
+      initializeShelterLocation(code, random);
+      initializeDangerZone(code, random);
+    }
+
+    initializeFunctionAll();
+
+    async function initializeShelterLocation(code, random) {
+      if (random) {
+        shelters = [...Array(5)].map((value, index) => {
+          const distance = Math.random() * 0.7 + 1.3;
+          const bearing = Math.random() * 360;
+          const position = geolib.computeDestinationPoint(
+            devicePosition,
+            1000 * distance,
+            bearing
+          );
+
+          const capacity = Math.floor(Math.random() * 100000);
+          const peopleNum = Math.floor(Math.random() * capacity);
+
+          const html = `<h3>Shelter ${index + 1}</h3>
+            <div>Capacity: ${capacity}</div>
+            <div>Now: ${peopleNum} (${(100 * (peopleNum / capacity)).toFixed(
+            1
+          )})</div>
+            <button onclick="route(devicePosition,shelters[${index}].position)">Walking Route</button>`;
+
+          return {
+            position: [position.longitude, position.latitude],
+            html: html,
+          };
+        });
+        if (located) {
+          shelterPopups = [];
+          shelterMarker.forEach((elem) => {
+            elem.remove();
+          });
+          shelterMarker = [];
+        }
+        shelters.forEach((elem) => {
+          addMarker(elem.position, elem.html);
+        });
+      } else {
+        if (code) {
+          const url = `https://mandryl-app-s3.s3.ap-northeast-1.amazonaws.com/json/Shelter-${code}.json`;
+          fetch(url)
+            .then((response) => {
+              return response.json();
+            })
+            .then((json) => {
+              if (Array.isArray(json)) {
+                shelters = json.map((value, index) => {
+                  const position = [value.item.Longitude, value.item.Latitude];
+                  const name = value.item.Name;
+                  const capacity = value.item.SeatingCapacity;
+                  const peopleNum = value.item.CurrentCapacity;
+
+                  const html = `<h3>${name}</h3>
+                <div>Capacity: ${capacity}</div>
+                <div>Now: ${peopleNum} (${(
+                      100 *
+                      (peopleNum / capacity)
+                    ).toFixed(1)})</div>
+                <button onclick="route(devicePosition,shelters[${index}].position)">Walking Route</button>`;
+
+                  return {
+                    position: position,
+                    html: html,
+                  };
+                });
+              } else {
+                shelters = [];
+              }
+            })
+            .then(() => {
+              shelters.forEach((elem) => {
+                addMarker(elem.position, elem.html);
+              });
+            })
+            .catch((error) => {
+              shelters = [];
+            });
+        } else {
+          shelters = [];
+        }
+      }
+    }
+
+    async function initializeDangerZone(code, random) {
+      if (random) {
+        const features = [...Array(10)].map(() => {
+          const distance = Math.random() * 1.0 + 1.0;
+          const bearing = Math.random() * 360;
+          const position = geolib.computeDestinationPoint(
+            devicePosition,
+            1000 * distance,
+            bearing
+          );
+          return {
+            type: "Feature",
+            properties: {
+              latitude: position.latitude,
+            },
+            geometry: {
+              type: "Point",
+              coordinates: [position.longitude, position.latitude],
+            },
+          };
+        });
+
+        dangerZone = {
+          type: "FeatureCollection",
+          features: features,
+        };
+      } else {
+        if (code) {
+          const url = `https://mandryl-app-s3.s3.ap-northeast-1.amazonaws.com/json/Danger-${code}.json`;
+          fetch(url)
+            .then((response) => {
+              return response.json();
+            })
+            .then((json) => {
+              dangerZone = json;
+            })
+            .catch((error) => {
+              dangerZone = {
+                type: "FeatureCollection",
+                features: [],
+              };
+            });
+        } else {
+          dangerZone = {
+            type: "FeatureCollection",
+            features: [],
+          };
+        }
+      }
+
+      if (random && located) {
+        if (map.getLayer("dangerZone")) {
+          map.removeLayer("dangerZone");
+        }
+        if (map.getSource("dangerZone")) {
+          map.removeSource("dangerZone");
+        }
+        addCircle("dangerZone", dangerZone, DANGER_RADIUS);
+      }
+
+      map.on("load", function () {
+        addCircle("dangerZone", dangerZone, DANGER_RADIUS);
+      });
+    }
+
+    function addCircle(name, sourceData) {
+      // set point
+      map.addSource(name, {
+        type: "geojson",
+        data: sourceData,
+      });
+
+      // set style
+      map.addLayer({
+        id: name,
+        type: "circle",
+        source: name,
+        layout: {},
+        paint: {
+          "circle-color": "#ce2c69",
+          "circle-radius": circleRadius(DANGER_RADIUS, 5, 22),
+          "circle-opacity": 0.3,
+        },
+      });
+    }
+
+    function circleRadius(meter, minZoom, maxZoom) {
+      const expressions = ["step", ["zoom"], 0];
+      for (let i = minZoom; i <= maxZoom; ++i) {
+        expressions.push(i);
+        expressions.push(convertExpression(meter, i));
+      }
+      return expressions;
+    }
+
+    function convertExpression(meter, zoomLv) {
+      return [
+        "/",
+        meter,
+        [
+          "/",
+          [
+            "*",
+            40075017,
+            [
+              "cos",
+              ["*", ["number", ["get", "latitude"]], ["/", ["pi"], 180]],
+            ],
+          ],
+          ["^", 2, zoomLv + 9],
+        ],
+      ];
+    }
+
+    async function verifySafeLines(route) {
+      console.log(route);
+      //距離とか初期化
+      let steps = route.Legs[0].Steps;
+      let distance = steps[0].Distance;
+      let sec = steps[0].DurationSeconds;
+      let lines = route.Legs[0].Geometry.LineString;
+      for (let i = 1; i + 1 < lines.length - 1; ++i) {
+        const test = isSafePathTest(lines[i], lines[i + 1]);
+        if (test.isSafe && steps[i]) {
+          distance += steps[i].Distance;
+          sec += steps[i].DurationSeconds;
+        } else {
+          let safe = [];
+          for (const dan of test.dangers) {
+            avoidPoints(dan).forEach(value => {
+              safe.push(value);
+            });
+          }
+          if(safe.length != 0){
+          const bounds = geolib.getBounds(safe);
+          const wayPoints = waypoints(lines[i],lines[i + 1],bounds);
+          const avoidRoute = await locationService
+            .calculateRoute({
+              CalculatorName: "TokyoRoute",
+              DeparturePosition: lines[i - 1],
+              DestinationPosition: lines[i + 1],
+              WaypointPositions: wayPoints,
+              DepartNow: true,
+              IncludeLegGeometry: true,
+              TravelMode: "Walking",
+            })
+            .promise();
+
+          const avoidSteps = avoidRoute.Legs[0].Steps;
+          const avoidLines = avoidRoute.Legs[0].Geometry.LineString;
+
+          steps.filter((value,index)=>index!=i&&index!=i+1&&index!=i-1);
+          lines.filter((value,index)=>index!=i&&index!=i+1);
+          for(let j = 0, len= avoidSteps.length; j < len; ++j){
+            lines.splice(i+j-1,0,avoidLines[j]);
+          }
+          for(let j = 0, len= avoidLines.length; j < len; ++j){
+            lines.splice(i+j,0,avoidLines[j]);
+          }
+          //戻す
+          i = i - 2;
+        }
+        }
+      }
+      return {steps,lines,distance,sec};
+    }
+
+    function waypoints(start, end, points){
+      const obj1 = popNearestPoint(start, points);
+      ways.push(obj1.nearest);
+      const obj2 = popNearestPoint(goal, obj1.popedArray);
+      const obj3 = popNearestPoint(obj1.nearest, obj2.popedArray);
+      const obj4 = popNearestPoint(obj2.nearest, obj3.popedArray);
+      return [obj1.nearest,obj3.nearest,obj4.nearest,obj2.nearest];
+    }
+
+    function isSafePathTest(start, end) {
+      const features = dangerZone.features;
+      let isSafe = true;
+      let dangers = [];
+      for (const f of features) {
+        const point = f.geometry.coordinates;
+        if (geolib.getDistanceFromLine(point, start, end) <= DANGER_RADIUS) {
+          isSafe = false;
+          dangers.push(point);
+        }
+      }
+      return { isSafe: isSafe, dangers: dangers };
+    }
+
+    function popNearestPoint(point, arrayPoints) {
+      const accuracy = 0.001;
+      let minI = 0;
+      let minP = arrayPoints[0];
+      let minDis = geolib.getDistance(point, arrayPoints[0]);
+      for (let i = 1, len = arrayPoints.length; len < i; ++i) {
+        const distance = geolib.getDistance(point, arrayPoints[i]);
+        if (distance < minI) {
+          minI = i;
+          minP = arrayPoins[i];
+          minDis = distance;
+        }
+      }
+      return {
+        nearest: minP,
+        popedArray: arrayPoints.filter((element, index) => index != minI),
+      };
+    }
+
+    function avoidPoints(point) {
+      return [...Array(3)].map((value, index) => {
+        const avoidPoint = geolib.computeDestinationPoint(
+          point,
+          2 * DANGER_RADIUS,
+          120 * index
+        );
+        return [avoidPoint.longitude, avoidPoint.latitude];
+      });
+    }
+  </script>
+</body>
+
+</html>
